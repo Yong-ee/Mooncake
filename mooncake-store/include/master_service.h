@@ -64,7 +64,7 @@ class MasterSnapshotCodecTest;  // test fixture, needs private state access
 }  // namespace ha
 
 class EtcdOpLogStore;
-class DfsGlobalAllocator;
+class GlobalAllocator;
 
 // Forward declarations
 class AllocationStrategy;
@@ -2568,7 +2568,7 @@ class MasterService {
 
     bool use_disk_replica_{false};
     bool enable_dfs_{false};
-    std::unique_ptr<DfsGlobalAllocator> dfs_allocator_;
+    std::unique_ptr<GlobalAllocator> dfs_allocator_;
 
     // Segment management
     SegmentManager segment_manager_;

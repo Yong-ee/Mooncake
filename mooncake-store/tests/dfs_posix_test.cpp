@@ -136,11 +136,10 @@ DistributedStorageConfig MakeAllocatorConfig(const std::string& mount_path,
     return config;
 }
 
-std::vector<DfsGlobalAllocator::EvictionCandidate>
-PrepareAndCommitPreparedEviction(DfsGlobalAllocator& allocator) {
-    auto pending = allocator.PrepareEviction();
-    auto candidates = pending.Candidates();
-    allocator.CommitPreparedEviction(std::move(pending));
+std::vector<GlobalAllocator::EvictionCandidate>
+PrepareAndCommitEviction(DfsGlobalAllocator& allocator) {
+    auto candidates = allocator.PrepareEviction();
+    allocator.ResolveEviction(candidates, std::vector<bool>(candidates.size(), true));
     return candidates;
 }
 
@@ -443,17 +442,16 @@ TEST(DfsGlobalAllocatorTest, ExhaustionAndEviction) {
     EXPECT_FALSE(exhausted.has_value());
     EXPECT_EQ(exhausted.error(), ErrorCode::NO_AVAILABLE_HANDLE);
 
-    auto pending = alloc.PrepareEviction();
-    auto evicted = pending.Candidates();
-    ASSERT_FALSE(evicted.empty());
-    EXPECT_EQ(evicted.front().key, "k0");
+    auto candidates = alloc.PrepareEviction();
+    ASSERT_FALSE(candidates.empty());
+    EXPECT_EQ(candidates.front().key, "k0");
 
     // Prepare only reserves candidates; their extents are not reusable until
     // the master accepts and commits the transaction.
     auto before_commit = alloc.Allocate("k_before_commit", 100);
     EXPECT_FALSE(before_commit.has_value());
 
-    alloc.CommitPreparedEviction(std::move(pending));
+    alloc.ResolveEviction(candidates, std::vector<bool>(candidates.size(), true));
 
     auto after_evict = alloc.Allocate("k_after_evict", 100);
     EXPECT_TRUE(after_evict.has_value());
@@ -477,17 +475,18 @@ TEST(DfsGlobalAllocatorTest, RestorePreparedEvictionPreservesCandidateOrder) {
         alloc.UpdateAccess(key, desc->shard_idx, desc->offset);
     }
 
-    auto pending = alloc.PrepareEviction();
-    ASSERT_EQ(pending.Candidates().size(), 2);
-    EXPECT_EQ(pending.Candidates()[0].key, "k0");
-    EXPECT_EQ(pending.Candidates()[1].key, "k1");
-    alloc.RestorePreparedEviction(std::move(pending));
+    auto candidates = alloc.PrepareEviction();
+    ASSERT_EQ(candidates.size(), 2);
+    EXPECT_EQ(candidates[0].key, "k0");
+    EXPECT_EQ(candidates[1].key, "k1");
+    // Abort: reject all candidates
+    alloc.ResolveEviction(candidates, {false, false});
 
     auto retry = alloc.PrepareEviction();
-    ASSERT_EQ(retry.Candidates().size(), 2);
-    EXPECT_EQ(retry.Candidates()[0].key, "k0");
-    EXPECT_EQ(retry.Candidates()[1].key, "k1");
-    alloc.RestorePreparedEviction(std::move(retry));
+    ASSERT_EQ(retry.size(), 2);
+    EXPECT_EQ(retry[0].key, "k0");
+    EXPECT_EQ(retry[1].key, "k1");
+    alloc.ResolveEviction(retry, {false, false});
 }
 
 TEST(DfsGlobalAllocatorTest, PartialResolutionContinuesToLowWatermark) {
@@ -510,24 +509,24 @@ TEST(DfsGlobalAllocatorTest, PartialResolutionContinuesToLowWatermark) {
         descs.push_back(*desc);
     }
 
-    auto pending = alloc.PrepareEviction();
-    ASSERT_EQ(pending.Candidates().size(), 2);
-    EXPECT_EQ(pending.Candidates()[0].key, "k0");
-    EXPECT_EQ(pending.Candidates()[1].key, "k1");
+    auto candidates = alloc.PrepareEviction();
+    ASSERT_EQ(candidates.size(), 2);
+    EXPECT_EQ(candidates[0].key, "k0");
+    EXPECT_EQ(candidates[1].key, "k1");
 
-    alloc.ResolvePreparedEviction(std::move(pending), {true, false});
+    alloc.ResolveEviction(candidates, {true, false});
     alloc.UpdateAccess("k1", descs[1].shard_idx, descs[1].offset);
 
     // Accepting only k0 drops usage below the high watermark but not the low
     // watermark. The same active eviction cycle must therefore continue and
     // reach k2 behind the restored, protected k1.
     auto continuation = alloc.PrepareEviction();
-    ASSERT_EQ(continuation.Candidates().size(), 1);
-    EXPECT_EQ(continuation.Candidates().front().key, "k2");
-    alloc.CommitPreparedEviction(std::move(continuation));
+    ASSERT_EQ(continuation.size(), 1);
+    EXPECT_EQ(continuation.front().key, "k2");
+    alloc.ResolveEviction(continuation, {true});
 
     auto complete = alloc.PrepareEviction();
-    EXPECT_TRUE(complete.Empty());
+    EXPECT_TRUE(complete.empty());
 }
 
 TEST(DfsGlobalAllocatorTest, EvictionCountsPendingFreeTowardWatermarks) {
@@ -549,12 +548,12 @@ TEST(DfsGlobalAllocatorTest, EvictionCountsPendingFreeTowardWatermarks) {
         alloc.UpdateAccess(key, desc->shard_idx, desc->offset);
     }
 
-    auto evicted = PrepareAndCommitPreparedEviction(alloc);
+    auto evicted = PrepareAndCommitEviction(alloc);
     ASSERT_EQ(evicted.size(), 2);
     EXPECT_EQ(evicted[0].key, "k0");
     EXPECT_EQ(evicted[1].key, "k1");
 
-    auto repeated = PrepareAndCommitPreparedEviction(alloc);
+    auto repeated = PrepareAndCommitEviction(alloc);
     EXPECT_TRUE(repeated.empty());
 
     auto before_release = alloc.Allocate("k_before_release", 100);
@@ -581,7 +580,7 @@ TEST(DfsGlobalAllocatorTest, FreeRemovesLruEntryBeforeOffsetReuse) {
     ASSERT_EQ(desc_b->offset, desc_a->offset);
     alloc.UpdateAccess("B", desc_b->shard_idx, desc_b->offset);
 
-    auto evicted = PrepareAndCommitPreparedEviction(alloc);
+    auto evicted = PrepareAndCommitEviction(alloc);
     ASSERT_EQ(evicted.size(), 1);
     EXPECT_EQ(evicted.front().key, "B");
 }
@@ -607,7 +606,7 @@ TEST(DfsGlobalAllocatorTest, StaleFreeDoesNotReleaseReusedOffset) {
 
     alloc.Free(desc_a->offset, desc_a->aligned_size, desc_a->shard_idx, "A");
 
-    auto evicted = PrepareAndCommitPreparedEviction(alloc);
+    auto evicted = PrepareAndCommitEviction(alloc);
     ASSERT_EQ(evicted.size(), 1);
     EXPECT_EQ(evicted.front().key, "B");
 }

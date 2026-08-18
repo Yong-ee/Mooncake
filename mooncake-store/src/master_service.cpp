@@ -52,6 +52,7 @@
 #include "utils/zstd_util.h"
 #include "utils/file_util.h"
 #include "storage/distributed/dfs_global_allocator.h"
+#include "storage/distributed/bucket_global_allocator.h"
 #include "storage/distributed/distributed_storage_backend.h"
 #include "random.h"
 #include "utils.h"
@@ -574,7 +575,14 @@ void MasterService::InitDfsAllocatorFromEnvironment(
         return;
     }
 
-    dfs_allocator_ = std::make_unique<DfsGlobalAllocator>();
+    // Select allocator type: bucket or shard
+    const auto allocator_type =
+        Environ::GetString("MOONCAKE_DFS_ALLOCATOR_TYPE", "shard");
+    if (allocator_type == "bucket") {
+        dfs_allocator_ = std::make_unique<BucketGlobalAllocator>();
+    } else {
+        dfs_allocator_ = std::make_unique<DfsGlobalAllocator>();
+    }
     auto init_result = dfs_allocator_->Init(dfs_config);
     if (!init_result) {
         LOG(ERROR) << "Failed to initialize DFS allocator, error="
@@ -6967,17 +6975,16 @@ void MasterService::RunDfsEviction() {
     std::set<CandidateIdentity> attempted;
 
     while (true) {
-        auto pending = dfs_allocator_->PrepareEviction();
-        if (pending.Empty()) return;
+        auto candidates = dfs_allocator_->PrepareEviction();
+        if (candidates.empty()) return;
 
-        const auto candidates = pending.Candidates();
         std::vector<bool> accepted(candidates.size(), false);
         std::vector<bool> considered(candidates.size(), false);
         bool saw_repeated_candidate = false;
 
         // Group prepared candidates by metadata shard, then validate and
         // remove each group while holding only that shard. Prepared allocator
-        // extents remain unavailable until ResolvePreparedEviction(), so
+        // extents remain unavailable until ResolveEviction(), so
         // different metadata shards do not need one cross-shard transaction.
         std::array<std::vector<size_t>, kNumShards> indexes_by_shard;
         for (size_t i = 0; i < candidates.size(); ++i) {
@@ -7076,7 +7083,7 @@ void MasterService::RunDfsEviction() {
             }
         }
 
-        dfs_allocator_->ResolvePreparedEviction(std::move(pending), accepted);
+        dfs_allocator_->ResolveEviction(candidates, accepted);
 
         // A protected allocation stays live, but moving it to the MRU side
         // lets this cycle inspect colder candidates behind it. The attempted

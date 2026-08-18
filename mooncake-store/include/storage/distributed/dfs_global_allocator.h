@@ -7,6 +7,7 @@
 #include <list>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <shared_mutex>
 #include <string>
 #include <unordered_map>
@@ -16,6 +17,7 @@
 
 #include "offset_allocator/offset_allocator.h"
 #include "replica.h"
+#include "storage/distributed/global_allocator.h"
 #include "storage/distributed/fs_adapter.h"
 #include "types.h"
 
@@ -23,7 +25,7 @@ namespace mooncake {
 
 struct DistributedStorageConfig;
 
-class DfsGlobalAllocator {
+class DfsGlobalAllocator : public GlobalAllocator {
    public:
     struct EvictionCandidate {
         std::string key;
@@ -66,31 +68,32 @@ class DfsGlobalAllocator {
     };
 
     DfsGlobalAllocator() = default;
-    ~DfsGlobalAllocator();
+    ~DfsGlobalAllocator() override;
 
     DfsGlobalAllocator(const DfsGlobalAllocator&) = delete;
     DfsGlobalAllocator& operator=(const DfsGlobalAllocator&) = delete;
 
-    tl::expected<void, ErrorCode> Init(const DistributedStorageConfig& config);
-    bool IsInitialized() const {
+    // GlobalAllocator interface
+    tl::expected<void, ErrorCode> Init(
+        const DistributedStorageConfig& config) override;
+    bool IsInitialized() const override {
         return initialized_.load(std::memory_order_acquire);
     }
 
     tl::expected<DistributedFSDescriptor, ErrorCode> Allocate(
-        const std::string& key, uint64_t size);
+        const std::string& key, uint64_t size) override;
     void Free(uint64_t offset, uint64_t aligned_size, int shard_idx,
-              const std::string& key);
-    void UpdateAccess(const std::string& key, int shard_idx, uint64_t offset);
-    PendingEviction PrepareEviction();
-    void CommitPreparedEviction(PendingEviction&& pending);
-    void RestorePreparedEviction(PendingEviction&& pending);
-    void ResolvePreparedEviction(PendingEviction&& pending,
-                                 const std::vector<bool>& accepted);
-
-    bool IsEvictionEnabled() const { return eviction_enabled_; }
-    std::chrono::seconds GetEvictionCheckInterval() const {
+              const std::string& key) override;
+    void UpdateAccess(const std::string& key, int shard_idx,
+                      uint64_t offset) override;
+    bool IsEvictionEnabled() const override { return eviction_enabled_; }
+    std::chrono::seconds GetEvictionCheckInterval() const override {
         return eviction_check_interval_;
     }
+
+    std::vector<EvictionCandidate> PrepareEviction() override;
+    void ResolveEviction(std::vector<EvictionCandidate>& candidates,
+                         const std::vector<bool>& accepted) override;
 
     static std::string FormatShardIdx(int idx, int shard_count);
 
@@ -161,6 +164,10 @@ class DfsGlobalAllocator {
     std::chrono::seconds eviction_check_interval_{5};
     std::atomic<bool> initialized_{false};
     std::array<std::mutex, kNumKeyStripes> key_stripes_;
+
+    // Pending eviction state for the abstract interface
+    std::mutex pending_mutex_;
+    std::optional<PendingEviction> active_pending_;
 };
 
 }  // namespace mooncake
